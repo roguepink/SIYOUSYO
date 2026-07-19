@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>工事手配指図書作成アプリ</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', 'Helvetica Neue', sans-serif;
+      background: #f5f5f5;
+      padding: 20px;
+      color: #333;
+    }
+    .container {
+      max-width: 900px;
+      margin: 0 auto;
+      background: white;
+      padding: 30px;
+      border-radius: 8px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+    }
+    h1 {
+      font-size: 28px;
+      margin-bottom: 30px;
+      text-align: center;
+      color: #1f4788;
+    }
+    h2 {
+      font-size: 22px;
+      margin-top: 30px;
+      margin-bottom: 20px;
+      color: #1f4788;
+    }
+    .form-group {
+      margin-bottom: 25px;
+    }
+    label {
+      display: block;
+      font-size: 16px;
+      font-weight: 500;
+      margin-bottom: 10px;
+      color: #2c3e50;
+    }
+    input[type="text"],
+    input[type="date"],
+    textarea,
+    select {
+      width: 100%;
+      padding: 16px;
+      font-size: 16px;
+      border: 2px solid #ddd;
+      border-radius: 6px;
+      font-family: inherit;
+      transition: border-color 0.3s;
+    }
+    input[type="text"]:focus,
+    input[type="date"]:focus,
+    textarea:focus,
+    select:focus {
+      outline: none;
+      border-color: #1f4788;
+      box-shadow: 0 0 0 3px rgba(31, 71, 136, 0.1);
+    }
+    textarea {
+      resize: vertical;
+      min-height: 100px;
+    }
+    .button-group {
+      display: flex;
+      gap: 15px;
+      flex-wrap: wrap;
+      margin-top: 15px;
+    }
+    button {
+      padding: 20px 30px;
+      font-size: 18px;
+      font-weight: 500;
+      border: 2px solid #1f4788;
+      background: #1f4788;
+      color: white;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: all 0.3s;
+      min-height: 60px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    button:hover {
+      background: #163550;
+      border-color: #163550;
+      transform: translateY(-2px);
+      box-shadow: 0 4px 12px rgba(31, 71, 136, 0.2);
+    }
+    button:active {
+      transform: translateY(0);
+    }
+    button.secondary {
+      background: white;
+      color: #1f4788;
+      border: 2px solid #1f4788;
+    }
+    button.secondary:hover {
+      background: #f0f4f8;
+    }
+    button.recording {
+      background: #e74c3c;
+      border-color: #e74c3c;
+      animation: pulse 1.5s infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(231, 76, 60, 0.7); }
+      50% { box-shadow: 0 0 0 10px rgba(231, 76, 60, 0); }
+    }
+    .task-item {
+      background: #f9f9f9;
+      padding: 20px;
+      margin-bottom: 15px;
+      border-left: 4px solid #1f4788;
+      border-radius: 4px;
+    }
+    .task-item input,
+    .task-item textarea {
+      margin-bottom: 10px;
+    }
+    .task-item textarea {
+      width: 100%;
+      min-height: 80px;
+    }
+    .task-item .delete-btn {
+      margin-top: 10px;
+    }
+    .map-container {
+      width: 100%;
+      height: 400px;
+      border: 2px solid #ddd;
+      border-radius: 6px;
+      margin-top: 15px;
+      overflow: hidden;
+    }
+    .map-container iframe {
+      width: 100%;
+      height: 100%;
+      border: none;
+    }
+    .status-message {
+      padding: 15px;
+      margin: 15px 0;
+      border-radius: 6px;
+      font-size: 16px;
+      display: none;
+    }
+    .status-message.show {
+      display: block;
+    }
+    .status-success {
+      background: #d4edda;
+      color: #155724;
+      border: 1px solid #c3e6cb;
+    }
+    .status-error {
+      background: #f8d7da;
+      color: #721c24;
+      border: 1px solid #f5c6cb;
+    }
+    .action-buttons {
+      display: flex;
+      gap: 15px;
+      margin-top: 30px;
+      flex-wrap: wrap;
+    }
+    .action-buttons button {
+      flex: 1;
+      min-width: 200px;
+    }
+    .grid-2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
+    }
+    @media (max-width: 768px) {
+      .grid-2 {
+        grid-template-columns: 1fr;
+      }
+      .container {
+        padding: 20px;
+      }
+      h1 {
+        font-size: 24px;
+      }
+      button {
+        padding: 18px 24px;
+        font-size: 16px;
+        min-height: 50px;
+      }
+      .map-container {
+        height: 300px;
+      }
+    }
+    @media print {
+      body { background: white; padding: 0; }
+      .container { max-width: 100%; box-shadow: none; padding: 0; margin: 0; }
+      h1, h2, label, input, textarea, button, .button-group, .action-buttons, .status-message { display: none; }
+      #pdfContent { display: block !important; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🏗️ 工事手配指図書作成アプリ</h1>
+
+    <div id="status" class="status-message status-success"></div>
+
+    <h2>📋 基本情報</h2>
+
+    <div class="form-group">
+      <label>元請会社名</label>
+      <div class="button-group">
+        <input type="text" id="clientName" placeholder="元請会社の名前" style="flex: 1;">
+        <button onclick="startVoice('clientName')" id="btn-clientName">🎤 音声入力</button>
+      </div>
+    </div>
+
+    <div class="form-group">
+      <label>現場名</label>
+      <div class="button-group">
+        <input type="text" id="siteName" placeholder="現場名を入力" style="flex: 1;">
+        <button onclick="startVoice('siteName')" id="btn-siteName">🎤 音声入力</button>
+      </div>
+    </div>
+
+    <div class="form-group">
+      <label>現場住所</label>
+      <div class="button-group">
+        <input type="text" id="siteAddress" placeholder="住所を入力" style="flex: 1;">
+        <button onclick="startVoice('siteAddress')" id="btn-siteAddress">🎤 音声入力</button>
+      </div>
+      <div id="mapContainer"></div>
+    </div>
+
+    <div class="form-group">
+      <label>工事名称</label>
+      <div class="button-group">
+        <input type="text" id="constructionName" placeholder="工事の種類（例：内装工事）" style="flex: 1;">
+        <button onclick="startVoice('constructionName')" id="btn-constructionName">🎤 音声入力</button>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="form-group">
+        <label>工事日数</label>
+        <input type="text" id="constructionDays" placeholder="例：3日間">
+      </div>
+      <div class="form-group">
+        <label>現場調査日</label>
+        <input type="date" id="surveyDate">
+      </div>
+    </div>
+
+    <div class="form-group">
+      <label>注意事項</label>
+      <textarea id="cautions" placeholder="安全管理、注意することを入力"></textarea>
+    </div>
+
+    <div class="form-group">
+      <label>連絡事項</label>
+      <textarea id="contacts" placeholder="その他の連絡事項"></textarea>
+    </div>
+
+    <div class="form-group">
+      <label>備考欄</label>
+      <textarea id="remarks" placeholder="特記事項などを入力"></textarea>
+    </div>
+
+    <h2>🔨 作業内容</h2>
+
+    <div id="tasksContainer"></div>
+
+    <button style="width: 100%; margin-bottom: 20px;" onclick="startVoice('newTask')" id="btn-newTask">
+      🎤 + 新しい作業を音声で追加
+    </button>
+
+    <button style="width: 100%; margin-bottom: 20px;" class="secondary" onclick="addTaskManual()">
+      + 新しい作業を手動で追加
+    </button>
+
+    <div class="action-buttons">
+      <button onclick="showPDF()">📄 PDF プレビュー</button>
+      <button class="secondary" onclick="resetForm()">🔄 フォームをリセット</button>
+    </div>
+  </div>
+
+  <div id="pdfContent" style="display: none; padding: 40px; background: white;"></div>
+
+  <script>
+    let recognition = null;
+    let currentField = '';
+    let taskIdCounter = 1000;
+    const formFields = ['clientName', 'siteName', 'siteAddress', 'constructionName', 'surveyDate', 'cautions', 'contacts', 'remarks'];
+    let tasks = [];
+
+    window.addEventListener('DOMContentLoaded', () => {
+      loadData();
+      initSpeechRecognition();
+      document.getElementById('siteAddress').addEventListener('change', updateMap);
+      showStatus('✅ アプリが起動しました');
+    });
+
+    function initSpeechRecognition() {
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (!SpeechRecognition) {
+        showStatus('⚠️ このブラウザは音声入力に対応していません', 'error');
+        return;
+      }
+
+      recognition = new SpeechRecognition();
+      recognition.lang = 'ja-JP';
+      recognition.continuous = false;
+
+      recognition.onstart = () => {
+        if (currentField) {
+          document.getElementById('btn-' + currentField).classList.add('recording');
+          showStatus('🎤 音声入力中...');
+        }
+      };
+
+      recognition.onresult = (event) => {
+        let transcript = '';
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          transcript += event.results[i][0].transcript;
+        }
+
+        if (currentField === 'newTask') {
+          addTask(transcript);
+          showStatus('✅ 作業を追加しました');
+        } else if (currentField) {
+          document.getElementById(currentField).value = transcript;
+          saveData();
+          if (currentField === 'siteAddress') {
+            updateMap();
+          }
+          showStatus('✅ 入力完了しました');
+        }
+        currentField = '';
+      };
+
+      recognition.onerror = (event) => {
+        showStatus('❌ エラー: ' + event.error, 'error');
+      };
+
+      recognition.onend = () => {
+        if (currentField) {
+          document.getElementById('btn-' + currentField).classList.remove('recording');
+        }
+      };
+    }
+
+    function startVoice(field) {
+      if (!recognition) {
+        showStatus('⚠️ 音声入力が利用できません', 'error');
+        return;
+      }
+      currentField = field;
+      recognition.start();
+    }
+
+    function addTask(content = '') {
+      const taskId = taskIdCounter++;
+      const task = { id: taskId, content, location: '', quantity: '', material: '', notes: '' };
+      tasks.push(task);
+      renderTasks();
+      saveData();
+    }
+
+    function addTaskManual() {
+      addTask();
+    }
+
+    function deleteTask(taskId) {
+      tasks = tasks.filter(t => t.id !== taskId);
+      renderTasks();
+      saveData();
+    }
+
+    function updateTaskField(taskId, field, value) {
+      const task = tasks.find(t => t.id === taskId);
+      if (task) {
+        task[field] = value;
+        saveData();
+      }
+    }
+
+    function renderTasks() {
+      const container = document.getElementById('tasksContainer');
+      container.innerHTML = '';
+      tasks.forEach((task, index) => {
+        const html = `
+          <div class="task-item">
+            <div style="font-size: 18px; font-weight: bold; color: #1f4788; margin-bottom: 10px;">作業 ${index + 1}</div>
+            <input type="text" value="${escapeHtml(task.content)}" placeholder="作業内容"
+              onchange="updateTaskField(${task.id}, 'content', this.value)">
+            <input type="text" value="${escapeHtml(task.location)}" placeholder="施工箇所"
+              onchange="updateTaskField(${task.id}, 'location', this.value)">
+            <input type="text" value="${escapeHtml(task.quantity)}" placeholder="数量"
+              onchange="updateTaskField(${task.id}, 'quantity', this.value)">
+            <input type="text" value="${escapeHtml(task.material)}" placeholder="材料"
+              onchange="updateTaskField(${task.id}, 'material', this.value)">
+            <textarea placeholder="備考"
+              onchange="updateTaskField(${task.id}, 'notes', this.value)">${escapeHtml(task.notes)}</textarea>
+            <button class="secondary delete-btn" onclick="deleteTask(${task.id})">🗑️ 削除</button>
+          </div>
+        `;
+        container.innerHTML += html;
+      });
+    }
+
+    function updateMap() {
+      const address = document.getElementById('siteAddress').value;
+      const container = document.getElementById('mapContainer');
+      if (address) {
+        container.innerHTML = `
+          <div class="map-container">
+            <iframe src="https://www.google.com/maps?q=${encodeURIComponent(address)}&output=embed"
+              allowfullscreen="" loading="lazy"></iframe>
+          </div>
+        `;
+      } else {
+        container.innerHTML = '';
+      }
+    }
+
+    function getFormData() {
+      return {
+        clientName: document.getElementById('clientName').value,
+        siteName: document.getElementById('siteName').value,
+        siteAddress: document.getElementById('siteAddress').value,
+        constructionName: document.getElementById('constructionName').value,
+        constructionDays: document.getElementById('constructionDays').value,
+        surveyDate: document.getElementById('surveyDate').value,
+        cautions: document.getElementById('cautions').value,
+        contacts: document.getElementById('contacts').value,
+        remarks: document.getElementById('remarks').value,
+        tasks: tasks
+      };
+    }
+
+    function saveData() {
+      localStorage.setItem('formData', JSON.stringify(getFormData()));
+    }
+
+    function loadData() {
+      const saved = localStorage.getItem('formData');
+      if (saved) {
+        try {
+          const data = JSON.parse(saved);
+          document.getElementById('clientName').value = data.clientName || '';
+          document.getElementById('siteName').value = data.siteName || '';
+          document.getElementById('siteAddress').value = data.siteAddress || '';
+          document.getElementById('constructionName').value = data.constructionName || '';
+          document.getElementById('constructionDays').value = data.constructionDays || '';
+          document.getElementById('surveyDate').value = data.surveyDate || '';
+          document.getElementById('cautions').value = data.cautions || '';
+          document.getElementById('contacts').value = data.contacts || '';
+          document.getElementById('remarks').value = data.remarks || '';
+          tasks = data.tasks || [];
+          taskIdCounter = (tasks.length > 0 ? Math.max(...tasks.map(t => t.id)) + 1 : 1000);
+          renderTasks();
+          updateMap();
+          showStatus('✅ 前回のデータを復元しました');
+        } catch (e) {
+          console.error('復元エラー:', e);
+        }
+      }
+    }
+
+    function showPDF() {
+      const data = getFormData();
+
+      let html = `
+        <div style="font-size: 14px; line-height: 1.8; color: black; max-width: 900px; margin: 0 auto;">
+          <div style="text-align: center; margin-bottom: 30px; border-bottom: 2px solid #333; padding-bottom: 20px;">
+            <h1 style="font-size: 28px; margin-bottom: 10px; color: black;">工事手配指図書</h1>
+            <p style="font-size: 12px; color: #666;">作成日：${new Date().toLocaleDateString('ja-JP')}</p>
+          </div>
+
+          <div style="margin-bottom: 20px; color: black;">
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
+              <div><strong>元請会社名：</strong> ${escapeHtml(data.clientName)}</div>
+              <div><strong>工事名称：</strong> ${escapeHtml(data.constructionName)}</div>
+              <div><strong>現場名：</strong> ${escapeHtml(data.siteName)}</div>
+              <div><strong>工事日数：</strong> ${escapeHtml(data.constructionDays)}</div>
+              <div style="grid-column: 1 / -1;"><strong>現場住所：</strong> ${escapeHtml(data.siteAddress)}</div>
+              <div><strong>現場調査日：</strong> ${data.surveyDate}</div>
+            </div>
+            ${data.cautions ? `<div style="margin-top: 15px; padding: 10px; background-color: #fff3cd; border-left: 4px solid #ffc107; color: black;"><strong>注意事項：</strong> ${escapeHtml(data.cautions)}</div>` : ''}
+          </div>
+
+          <div style="margin-top: 40px; padding-top: 20px; color: black;">
+            <h2 style="font-size: 18px; margin-bottom: 20px; border-bottom: 2px solid #333; padding-bottom: 10px; color: black;">作業内容</h2>
+            ${data.tasks.length > 0 ? data.tasks.map((t, i) => `
+              <div style="margin-bottom: 20px; padding: 15px; border: 1px solid #ddd; border-radius: 4px; color: black;">
+                <div style="font-weight: bold; margin-bottom: 10px; font-size: 16px;">作業 ${i + 1}</div>
+                <table style="width: 100%; font-size: 13px;">
+                  <tr><td style="font-weight: bold; padding: 8px 0; width: 30%;">作業内容：</td><td>${escapeHtml(t.content)}</td></tr>
+                  <tr><td style="font-weight: bold; padding: 8px 0;">施工箇所：</td><td>${escapeHtml(t.location)}</td></tr>
+                  <tr><td style="font-weight: bold; padding: 8px 0;">数量：</td><td>${escapeHtml(t.quantity)}</td></tr>
+                  <tr><td style="font-weight: bold; padding: 8px 0;">材料：</td><td>${escapeHtml(t.material)}</td></tr>
+                  ${t.notes ? `<tr><td style="font-weight: bold; padding: 8px 0;">備考：</td><td>${escapeHtml(t.notes)}</td></tr>` : ''}
+                </table>
+              </div>
+            `).join('') : '<p style="color: #999;">作業内容が登録されていません</p>'}
+          </div>
+
+          ${(data.contacts || data.remarks) ? `
+            <div style="margin-top: 30px; padding-top: 20px; color: black;">
+              <h2 style="font-size: 18px; margin-bottom: 20px; border-bottom: 2px solid #333; padding-bottom: 10px;">その他</h2>
+              ${data.contacts ? `<div style="margin-bottom: 15px;"><strong>連絡事項：</strong><br>${escapeHtml(data.contacts)}</div>` : ''}
+              ${data.remarks ? `<div><strong>備考欄：</strong><br>${escapeHtml(data.remarks)}</div>` : ''}
+            </div>
+          ` : ''}
+        </div>
+      `;
+
+      document.getElementById('pdfContent').innerHTML = html;
+
+      setTimeout(() => {
+        showStatus('✅ 印刷画面を開きます（Ctrl+P または Command+P）');
+        window.print();
+      }, 100);
+    }
+
+    function resetForm() {
+      if (window.confirm('フォームをリセットしますか？')) {
+        formFields.forEach(field => {
+          document.getElementById(field).value = '';
+        });
+        tasks = [];
+        taskIdCounter = 1000;
+        renderTasks();
+        updateMap();
+        localStorage.removeItem('formData');
+        showStatus('🔄 フォームをリセットしました');
+      }
+    }
+
+    function showStatus(message, type = 'success') {
+      const el = document.getElementById('status');
+      el.textContent = message;
+      el.className = 'status-message show ' + (type === 'error' ? 'status-error' : 'status-success');
+      setTimeout(() => el.classList.remove('show'), 4000);
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+  </script>
+</body>
+</html>
