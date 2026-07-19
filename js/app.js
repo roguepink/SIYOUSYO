@@ -4,14 +4,24 @@
 const DOCS_KEY = "siyousyo.documents";
 const SETTINGS_KEY = "siyousyo.settings";
 const OLD_KEY = "formData";
+const TUTORIAL_KEY = "siyousyo.tutorialSeen";
 
 const DEFAULT_SETTINGS = {
   theme: "auto",
-  company: { name: "", person: "", tel: "" },
+  company: { name: "", person: "", tel: "", logo: "" },
   presets: {
     clients: [],
     constructions: ["内装工事", "電気工事", "給排水工事", "外壁塗装工事", "解体工事", "リフォーム工事"],
-    tasks: ["内装解体", "クロス張替え", "床材張替え", "電気配線", "給排水設備", "塗装", "建具交換", "クリーニング"],
+    tasks: [
+      { content: "内装解体", material: "" },
+      { content: "クロス張替え", material: "ビニールクロス" },
+      { content: "床材張替え", material: "フローリング材" },
+      { content: "電気配線", material: "" },
+      { content: "給排水設備", material: "" },
+      { content: "塗装", material: "" },
+      { content: "建具交換", material: "" },
+      { content: "クリーニング", material: "" },
+    ],
   },
   defaultCautions: "",
 };
@@ -26,6 +36,10 @@ let speechSupported = false;
 let recognition = null;
 let voiceTarget = null;
 let lastTranscript = "";
+let liveSettings = null;
+let pendingPhotoId = null;
+let taskSheetSnapshot = null;
+let navDepth = 0;
 
 /* ===================== Utilities ===================== */
 function genId() {
@@ -49,6 +63,9 @@ function formatDate(ts) {
   return d.toLocaleDateString("ja-JP", { month: "numeric", day: "numeric" }) + " " + d.toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" });
 }
 function $(id) { return document.getElementById(id); }
+function vibrate(ms) {
+  try { navigator.vibrate && navigator.vibrate(ms || 10); } catch (e) { /* unsupported */ }
+}
 
 /* ===================== Toast ===================== */
 function showToast(message, opts = {}) {
@@ -82,7 +99,7 @@ function openEphemeral(innerHtml, { center = false } = {}) {
 function showConfirmDialog(message, confirmLabel, onConfirm, danger = false) {
   const { overlay, close } = openEphemeral(
     `<div class="sheet-header"><h3>確認</h3></div>
-     <p style="font-size:14.5px;line-height:1.7;margin-bottom:18px;">${escapeHtml(message)}</p>
+     <p style="font-size:14.5px;line-height:1.7;margin-bottom:18px;white-space:pre-line;">${escapeHtml(message)}</p>
      <div style="display:flex;gap:10px;">
        <button class="btn btn-secondary" data-act="cancel">キャンセル</button>
        <button class="btn ${danger ? "btn-danger" : "btn-primary"}" data-act="ok">${escapeHtml(confirmLabel)}</button>
@@ -107,6 +124,126 @@ function showDocActions(doc) {
   overlay.querySelector('[data-act="del"]').onclick = () => { close(); confirmDeleteDoc(doc.id); };
 }
 
+/* ===================== Back-button navigation (overlays only) =====================
+   #overlayTask / #overlaySettings / #overlayVoice each push one history entry when
+   opened, so the hardware/gesture back button closes them instead of leaving the app. */
+function pushNav() { navDepth++; history.pushState({ appNav: navDepth }, ""); }
+function goBackOneLevel() { if (navDepth > 0) history.back(); }
+window.addEventListener("popstate", () => {
+  if (navDepth > 0) navDepth--;
+  handleBackNavigation();
+});
+function handleBackNavigation() {
+  if ($("overlayVoice").classList.contains("show")) { cancelVoiceUI(); return; }
+  if ($("overlayTask").classList.contains("show")) { requestCloseTaskSheet(true); return; }
+  if ($("overlaySettings").classList.contains("show")) { closeSettingsSheet(); return; }
+}
+
+/* ===================== IndexedDB photo store ===================== */
+const PHOTO_DB_NAME = "siyousyoPhotos";
+const PHOTO_STORE = "photos";
+function openPhotoDb() {
+  return new Promise((resolve, reject) => {
+    if (!window.indexedDB) return reject(new Error("no-indexeddb"));
+    const req = indexedDB.open(PHOTO_DB_NAME, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(PHOTO_STORE);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function savePhotoBlob(id, blob) {
+  const db = await openPhotoDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(PHOTO_STORE, "readwrite");
+    tx.objectStore(PHOTO_STORE).put(blob, id);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+async function getPhotoBlob(id) {
+  if (!id) return null;
+  try {
+    const db = await openPhotoDb();
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(PHOTO_STORE, "readonly");
+      const req = tx.objectStore(PHOTO_STORE).get(id);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+  } catch (e) { return null; }
+}
+async function deletePhotoBlob(id) {
+  const db = await openPhotoDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(PHOTO_STORE, "readwrite");
+    tx.objectStore(PHOTO_STORE).delete(id);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+async function getAllPhotoIds() {
+  const db = await openPhotoDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(PHOTO_STORE, "readonly");
+    const req = tx.objectStore(PHOTO_STORE).getAllKeys();
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function cleanupOrphanPhotos() {
+  try {
+    const referenced = new Set();
+    documentsCache.forEach((d) => d.tasks.forEach((t) => { if (t.photoId) referenced.add(t.photoId); }));
+    const allIds = await getAllPhotoIds();
+    const toDelete = allIds.filter((id) => !referenced.has(id));
+    await Promise.all(toDelete.map((id) => deletePhotoBlob(id)));
+  } catch (e) { /* IndexedDB unavailable — skip cleanup */ }
+}
+
+/* ===================== Image helpers ===================== */
+function resizeImageFile(file, maxDim, quality) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      let { width, height } = img;
+      if (width > maxDim || height > maxDim) {
+        if (width > height) { height = Math.round((height * maxDim) / width); width = maxDim; }
+        else { width = Math.round((width * maxDim) / height); height = maxDim; }
+      }
+      const canvas = document.createElement("canvas");
+      canvas.width = width; canvas.height = height;
+      canvas.getContext("2d").drawImage(img, 0, 0, width, height);
+      canvas.toBlob((blob) => { URL.revokeObjectURL(url); blob ? resolve(blob) : reject(new Error("toBlob failed")); }, "image/jpeg", quality);
+    };
+    img.onerror = (e) => { URL.revokeObjectURL(url); reject(e); };
+    img.src = url;
+  });
+}
+function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+/* ===================== JSONP (for zipcloud, which has no CORS headers) ===================== */
+let jsonpCounter = 0;
+function jsonpRequest(url) {
+  return new Promise((resolve, reject) => {
+    const cbName = "siyousyoJsonp" + jsonpCounter++;
+    const script = document.createElement("script");
+    const cleanup = () => { delete window[cbName]; script.remove(); };
+    window[cbName] = (data) => { cleanup(); resolve(data); };
+    script.src = url + (url.includes("?") ? "&" : "?") + "callback=" + cbName;
+    script.onerror = () => { cleanup(); reject(new Error("jsonp failed")); };
+    document.body.appendChild(script);
+    setTimeout(() => { if (window[cbName]) { cleanup(); reject(new Error("timeout")); } }, 8000);
+  });
+}
+
 /* ===================== Documents store ===================== */
 function loadDocumentsFromStorage() {
   try {
@@ -118,6 +255,7 @@ function loadDocumentsFromStorage() {
 function saveDocuments() {
   localStorage.setItem(DOCS_KEY, JSON.stringify(documentsCache));
 }
+const debouncedSaveDocuments = debounce(saveDocuments, 500);
 function getCurrentDoc() {
   return documentsCache.find((d) => d.id === currentDocId);
 }
@@ -125,7 +263,7 @@ function newDocTemplate() {
   const now = Date.now();
   return {
     id: genId(), createdAt: now, updatedAt: now,
-    clientName: "", siteName: "", siteAddress: "", constructionName: "",
+    clientName: "", siteName: "", siteAddress: "", siteLatLng: null, constructionName: "",
     constructionDays: "", surveyDate: "",
     cautions: getSettings().defaultCautions || "", contacts: "", remarks: "",
     tasks: [],
@@ -139,7 +277,7 @@ function migrateOldData() {
     const d = JSON.parse(old);
     const doc = newDocTemplate();
     ["clientName", "siteName", "siteAddress", "constructionName", "constructionDays", "surveyDate", "cautions", "contacts", "remarks"].forEach((k) => { doc[k] = d[k] || ""; });
-    doc.tasks = (d.tasks || []).map((t) => ({ id: genId(), content: t.content || "", location: t.location || "", quantity: t.quantity || "", material: t.material || "", notes: t.notes || "" }));
+    doc.tasks = (d.tasks || []).map((t) => ({ id: genId(), content: t.content || "", location: t.location || "", quantity: t.quantity || "", material: t.material || "", notes: t.notes || "", photoId: null }));
     documentsCache = [doc];
     saveDocuments();
     localStorage.removeItem(OLD_KEY);
@@ -181,13 +319,15 @@ function cloneDefaultSettings() { return JSON.parse(JSON.stringify(DEFAULT_SETTI
 function mergeSettings(s) {
   const d = cloneDefaultSettings();
   s = s || {};
+  const rawTasks = Array.isArray(s.presets && s.presets.tasks) ? s.presets.tasks : d.presets.tasks;
+  const tasks = rawTasks.map((t) => (typeof t === "string" ? { content: t, material: "" } : { content: t.content || "", material: t.material || "" }));
   return {
     theme: s.theme || d.theme,
     company: { ...d.company, ...(s.company || {}) },
     presets: {
       clients: Array.isArray(s.presets && s.presets.clients) ? s.presets.clients : d.presets.clients,
       constructions: Array.isArray(s.presets && s.presets.constructions) ? s.presets.constructions : d.presets.constructions,
-      tasks: Array.isArray(s.presets && s.presets.tasks) ? s.presets.tasks : d.presets.tasks,
+      tasks,
     },
     defaultCautions: s.defaultCautions || d.defaultCautions,
   };
@@ -202,11 +342,15 @@ function getSettings() {
   }
 }
 function saveSettings(s) { localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); }
+const debouncedSaveSettings = debounce(() => { if (liveSettings) saveSettings(liveSettings); }, 500);
 
 function applyTheme(theme) {
   if (theme === "dark") document.documentElement.setAttribute("data-theme", "dark");
   else if (theme === "light") document.documentElement.setAttribute("data-theme", "light");
   else document.documentElement.removeAttribute("data-theme");
+  const isDark = theme === "dark" || (theme === "auto" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+  const meta = $("themeColorMeta");
+  if (meta) meta.setAttribute("content", isDark ? "#10151f" : "#1f4788");
 }
 function highlightThemeChips(theme) {
   document.querySelectorAll("[data-theme-choice]").forEach((c) => c.classList.toggle("selected", c.dataset.themeChoice === theme));
@@ -272,7 +416,8 @@ function handleFieldChange(id) {
   if (!doc) return;
   doc[id] = $(id).value;
   doc.updatedAt = Date.now();
-  saveDocuments();
+  if (id === "siteAddress") doc.siteLatLng = null;
+  debouncedSaveDocuments();
   if (id === "siteAddress") debouncedMapUpdate();
   if (id === "clientName" || id === "constructionName") renderClientConstructionChips();
 }
@@ -280,9 +425,19 @@ const debouncedMapUpdate = debounce(updateMapPreview, 700);
 
 /* ===================== Home / document list ===================== */
 function renderDocList() {
-  const docs = documentsCache.slice().sort((a, b) => b.updatedAt - a.updatedAt);
-  $("docList").innerHTML = docs.map(cardHtml).join("");
-  $("docListEmpty").classList.toggle("hidden", docs.length > 0);
+  const totalDocs = documentsCache.length;
+  const filter = (($("docSearch") && $("docSearch").value) || "").trim().toLowerCase();
+  let docs = documentsCache.slice().sort((a, b) => b.updatedAt - a.updatedAt);
+  if (filter) {
+    docs = docs.filter((d) => [d.siteName, d.clientName, d.constructionName].some((v) => (v || "").toLowerCase().includes(filter)));
+  }
+  if (totalDocs > 0 && filter && docs.length === 0) {
+    $("docList").innerHTML = `<p class="muted text-center mt-16">🔍 該当する指図書が見つかりませんでした</p>`;
+  } else {
+    $("docList").innerHTML = docs.map(cardHtml).join("");
+  }
+  $("docListEmpty").classList.toggle("hidden", totalDocs > 0);
+  $("docSearchRow").classList.toggle("hidden", totalDocs === 0);
 }
 function cardHtml(doc) {
   const title = doc.siteName || doc.constructionName || "名称未設定の指図書";
@@ -312,25 +467,72 @@ function renderClientConstructionChips() {
   constrChips.innerHTML = s.presets.constructions.map((v) => `<div class="chip ${doc && doc.constructionName === v ? "selected" : ""}" data-chip-constr="${escapeAttr(v)}">${escapeHtml(v)}</div>`).join("");
 }
 
-/* ===================== Map preview ===================== */
-function updateMapPreview() {
-  const address = $("siteAddress").value.trim();
-  const container = $("mapContainer");
-  if (!address) { container.innerHTML = ""; return; }
-  const mapsUrl = "https://www.google.com/maps/search/?api=1&query=" + encodeURIComponent(address);
-  container.innerHTML = `<div class="map-preview">
-    <iframe src="https://www.google.com/maps?q=${encodeURIComponent(address)}&output=embed" loading="lazy" allowfullscreen=""></iframe>
-    <a class="map-open-link" href="${mapsUrl}" target="_blank" rel="noopener">🗺️ Googleマップで開く</a>
-  </div>`;
+/* ===================== Map / address ===================== */
+function getMapQueryForDoc(doc) {
+  if (doc.siteLatLng) return doc.siteLatLng.lat + "," + doc.siteLatLng.lng;
+  return (doc.siteAddress || "").trim();
 }
-function addressBlockHtml(address) {
-  if (!address) return "";
-  const mapsUrl = "https://www.google.com/maps/search/?api=1&query=" + encodeURIComponent(address);
+function addressBlockHtml(query, displayText) {
+  if (!query) return "";
+  const mapsUrl = "https://www.google.com/maps/search/?api=1&query=" + encodeURIComponent(query);
   const qrUrl = "https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=" + encodeURIComponent(mapsUrl);
+  const label = displayText || query;
   return `<div class="address-card">
     <div class="qr-wrap"><img src="${qrUrl}" alt="QRコード" loading="lazy" onerror="this.parentElement.style.display='none'"></div>
-    <div class="addr-text">📍 ${escapeHtml(address)}<br><a href="${mapsUrl}" target="_blank" rel="noopener">Googleマップで開く ↗</a></div>
+    <div class="addr-text">📍 ${escapeHtml(label)}<br><a href="${mapsUrl}" target="_blank" rel="noopener">Googleマップで開く ↗</a></div>
   </div>`;
+}
+function updateMapPreview() {
+  const doc = getCurrentDoc();
+  const container = $("mapContainer");
+  if (!doc) { container.innerHTML = ""; return; }
+  const query = getMapQueryForDoc(doc);
+  container.innerHTML = query ? addressBlockHtml(query, doc.siteLatLng ? "📍 現在地のピンを設定しました" : doc.siteAddress) : "";
+}
+function useGpsForAddress() {
+  if (!navigator.geolocation) { showToast("⚠️ この端末は位置情報に対応していません", { type: "error" }); return; }
+  const doc = getCurrentDoc();
+  if (!doc) return;
+  showToast("📍 現在地を取得中...");
+  navigator.geolocation.getCurrentPosition(
+    (pos) => {
+      doc.siteLatLng = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+      doc.updatedAt = Date.now();
+      saveDocuments();
+      updateMapPreview();
+      vibrate(10);
+      showToast("✅ 現在地を地図ピンに設定しました");
+    },
+    (err) => { showToast("❌ 位置情報を取得できませんでした：" + (err.message || ""), { type: "error" }); },
+    { enableHighAccuracy: true, timeout: 10000 }
+  );
+}
+function openZipLookup() {
+  const { overlay } = openEphemeral(
+    `<div class="sheet-header"><h3>郵便番号で住所を検索</h3></div>
+     <div class="field"><input type="text" id="zipInput" inputmode="numeric" placeholder="例：1500001（ハイフンなし）"></div>
+     <button class="btn btn-primary" data-act="search">住所を検索</button>
+     <p class="small-note mt-8" id="zipResultNote"></p>`,
+    { center: true }
+  );
+  overlay.querySelector('[data-act="search"]').onclick = async () => {
+    const zip = overlay.querySelector("#zipInput").value.replace(/[^0-9]/g, "");
+    const note = overlay.querySelector("#zipResultNote");
+    if (zip.length !== 7) { note.textContent = "7桁の数字で入力してください"; return; }
+    note.textContent = "検索中...";
+    try {
+      const data = await jsonpRequest("https://zipcloud.ibsnet.co.jp/api/search?zipcode=" + zip);
+      const r = data.results && data.results[0];
+      if (!r) { note.textContent = "該当する住所が見つかりませんでした"; return; }
+      const addr = r.address1 + r.address2 + r.address3;
+      $("siteAddress").value = addr;
+      handleFieldChange("siteAddress");
+      overlay.remove();
+      showToast("✅ 住所を入力しました。番地・建物名は音声などで追加してください");
+    } catch (e) {
+      note.textContent = "通信エラーが発生しました";
+    }
+  };
 }
 
 /* ===================== Tasks ===================== */
@@ -339,14 +541,22 @@ function renderTasks() {
   if (!doc) return;
   $("tasksContainer").innerHTML = doc.tasks.map((t, i) => taskCardHtml(t, i, doc.tasks.length)).join("");
   $("tasksEmpty").classList.toggle("hidden", doc.tasks.length > 0);
+  loadTaskThumbnails();
+}
+function loadTaskThumbnails() {
+  document.querySelectorAll(".task-thumb[data-photo-id]").forEach((img) => {
+    getPhotoBlob(img.dataset.photoId).then((blob) => { if (blob) img.src = URL.createObjectURL(blob); });
+  });
 }
 function taskCardHtml(t, i, total) {
   const detail = [];
   if (t.location) detail.push(`<span>📍 ${escapeHtml(t.location)}</span>`);
   if (t.quantity) detail.push(`<span>📦 ${escapeHtml(t.quantity)}</span>`);
   if (t.material) detail.push(`<span>🧱 ${escapeHtml(t.material)}</span>`);
+  const photoThumb = t.photoId ? `<img class="task-thumb" data-photo-id="${escapeAttr(t.photoId)}" alt="現場写真">` : "";
   return `<div class="task-card" data-task-id="${escapeAttr(t.id)}">
     <div class="task-num">${i + 1}</div>
+    ${photoThumb}
     <div class="task-body" data-open-task="${escapeAttr(t.id)}">
       <div class="task-content">${escapeHtml(t.content) || "(内容未入力)"}</div>
       <div class="task-detail">${detail.join("")}</div>
@@ -392,9 +602,27 @@ function deleteTask(id) {
 }
 
 function renderTaskTemplateChips() {
-  const s = getSettings();
-  $("chipsTaskTemplate").innerHTML = s.presets.tasks.map((v) => `<div class="chip" data-tpl="${escapeAttr(v)}">${escapeHtml(v)}</div>`).join("")
+  const tasks = getSettings().presets.tasks;
+  $("chipsTaskTemplate").innerHTML = tasks.map((v) => `<div class="chip" data-tpl-content="${escapeAttr(v.content)}" data-tpl-material="${escapeAttr(v.material || "")}">${escapeHtml(v.content)}</div>`).join("")
     || `<span class="muted">⚙️ 設定画面からよく使う作業を登録できます</span>`;
+}
+
+function currentTaskSheetSnapshot() {
+  return JSON.stringify([$("taskContent").value, $("taskLocation").value, $("taskQuantity").value, $("taskMaterial").value, $("taskNotes").value, pendingPhotoId]);
+}
+function isTaskSheetDirty() {
+  return taskSheetSnapshot !== null && currentTaskSheetSnapshot() !== taskSheetSnapshot;
+}
+function renderTaskPhotoUI() {
+  const row = $("taskPhotoRow");
+  if (pendingPhotoId) {
+    row.innerHTML = `<div class="photo-thumb-wrap"><img id="taskPhotoThumb" class="photo-thumb" alt="現場写真"><button class="photo-remove-btn" id="btnRemoveTaskPhoto" aria-label="写真を削除">✕</button></div>`;
+    getPhotoBlob(pendingPhotoId).then((blob) => { if (blob) $("taskPhotoThumb").src = URL.createObjectURL(blob); });
+    $("btnRemoveTaskPhoto").onclick = () => { pendingPhotoId = null; renderTaskPhotoUI(); };
+  } else {
+    row.innerHTML = `<button class="btn btn-secondary btn-sm" id="btnAddTaskPhoto">📷 写真を追加</button>`;
+    $("btnAddTaskPhoto").onclick = () => $("taskPhotoInput").click();
+  }
 }
 
 function openTaskSheet(taskId) {
@@ -409,15 +637,33 @@ function openTaskSheet(taskId) {
     $("taskQuantity").value = t.quantity;
     $("taskMaterial").value = t.material;
     $("taskNotes").value = t.notes;
+    pendingPhotoId = t.photoId || null;
   } else {
     $("taskSheetTitle").textContent = "作業を追加";
     ["taskContent", "taskLocation", "taskQuantity", "taskMaterial", "taskNotes"].forEach((id) => { $(id).value = ""; });
+    pendingPhotoId = null;
   }
+  renderTaskPhotoUI();
   $("overlayTask").classList.add("show");
+  taskSheetSnapshot = currentTaskSheetSnapshot();
+  pushNav();
 }
-function closeTaskSheet() {
+function actualCloseTaskSheet() {
   $("overlayTask").classList.remove("show");
   editingTaskId = null;
+  pendingPhotoId = null;
+  taskSheetSnapshot = null;
+}
+function requestCloseTaskSheet(fromHistory) {
+  if (isTaskSheetDirty()) {
+    showConfirmDialog("保存していない内容があります。閉じますか？", "閉じる", () => {
+      actualCloseTaskSheet();
+      if (!fromHistory) goBackOneLevel();
+    }, true);
+  } else {
+    actualCloseTaskSheet();
+    if (!fromHistory) goBackOneLevel();
+  }
 }
 function saveTaskFromSheet() {
   const content = $("taskContent").value.trim();
@@ -433,6 +679,7 @@ function saveTaskFromSheet() {
     quantity: $("taskQuantity").value.trim(),
     material: $("taskMaterial").value.trim(),
     notes: $("taskNotes").value.trim(),
+    photoId: pendingPhotoId || null,
   };
   if (editingTaskId) {
     const t = doc.tasks.find((t) => t.id === editingTaskId);
@@ -443,7 +690,9 @@ function saveTaskFromSheet() {
   doc.updatedAt = Date.now();
   saveDocuments();
   renderTasks();
-  closeTaskSheet();
+  vibrate(10);
+  actualCloseTaskSheet();
+  goBackOneLevel();
   showToast("✅ 作業を保存しました");
 }
 
@@ -452,7 +701,8 @@ function renderReview() {
   const doc = getCurrentDoc();
   if (!doc) return;
   let html = "";
-  if (doc.siteAddress) html += addressBlockHtml(doc.siteAddress);
+  const query = getMapQueryForDoc(doc);
+  if (query) html += addressBlockHtml(query, doc.siteLatLng ? "📍 現在地のピン" : doc.siteAddress);
   html += `<div class="review-card"><h4>基本情報</h4>
     <div class="review-row"><span class="k">元請会社名</span><span class="v">${escapeHtml(doc.clientName) || "ー"}</span></div>
     <div class="review-row"><span class="k">現場名</span><span class="v">${escapeHtml(doc.siteName) || "ー"}</span></div>
@@ -462,7 +712,7 @@ function renderReview() {
   </div>`;
   html += `<div class="review-card"><h4>作業内容（${doc.tasks.length}件）</h4>${
     doc.tasks.length
-      ? doc.tasks.map((t, i) => `<div class="review-row"><span class="k">作業${i + 1}</span><span class="v">${escapeHtml(t.content) || "(内容未入力)"}</span></div>`).join("")
+      ? doc.tasks.map((t, i) => `<div class="review-row"><span class="k">作業${i + 1}</span><span class="v">${escapeHtml(t.content) || "(内容未入力)"}${t.photoId ? " 📷" : ""}</span></div>`).join("")
       : '<p class="muted">まだ登録されていません</p>'
   }</div>`;
   $("reviewArea").innerHTML = html;
@@ -482,14 +732,27 @@ function waitForImages(container, timeoutMs) {
     }))
   );
 }
+async function fillPdfPhotos(container) {
+  const imgs = Array.from(container.querySelectorAll("img[data-pdf-photo]"));
+  await Promise.all(imgs.map(async (img) => {
+    try {
+      const blob = await getPhotoBlob(img.dataset.pdfPhoto);
+      if (blob) img.src = await blobToDataUrl(blob);
+      else { const wrap = img.closest(".pdf-photo-wrap"); if (wrap) wrap.remove(); }
+    } catch (e) { const wrap = img.closest(".pdf-photo-wrap"); if (wrap) wrap.remove(); }
+  }));
+}
 function buildPdfHtml(doc, settings) {
   const today = new Date().toLocaleDateString("ja-JP");
   const c = settings.company;
+  const logoLine = c.logo ? `<img src="${c.logo}" style="height:44px;display:block;margin:0 auto 10px;">` : "";
   const companyLine = c.name
     ? `<div style="margin-top:26px;padding-top:14px;border-top:1px solid #ccc;font-size:12px;color:#444;">作成：${escapeHtml(c.name)}${c.person ? " 担当 " + escapeHtml(c.person) : ""}${c.tel ? " TEL " + escapeHtml(c.tel) : ""}</div>`
     : "";
-  return `<div style="font-size:14px;line-height:1.8;color:#111;max-width:900px;margin:0 auto;">
+  const query = getMapQueryForDoc(doc);
+  return `<div style="font-size:14px;line-height:1.8;color:#111;max-width:900px;margin:0 auto;padding:24px;background:#fff;">
     <div style="text-align:center;margin-bottom:24px;border-bottom:2px solid #333;padding-bottom:16px;">
+      ${logoLine}
       <h1 style="font-size:26px;margin-bottom:8px;">工事手配指図書</h1>
       <p style="font-size:12px;color:#666;">作成日：${today}</p>
     </div>
@@ -501,7 +764,8 @@ function buildPdfHtml(doc, settings) {
         <div><strong>工事日数：</strong>${escapeHtml(doc.constructionDays) || "ー"}</div>
         <div><strong>現場調査日：</strong>${doc.surveyDate || "ー"}</div>
       </div>
-      ${doc.siteAddress ? `<div style="margin-bottom:10px;"><strong>現場住所：</strong>${escapeHtml(doc.siteAddress)}</div>${addressBlockHtml(doc.siteAddress)}` : ""}
+      ${doc.siteAddress ? `<div style="margin-bottom:10px;"><strong>現場住所：</strong>${escapeHtml(doc.siteAddress)}</div>` : ""}
+      ${query ? addressBlockHtml(query, doc.siteLatLng ? "現在地のピン" : doc.siteAddress) : ""}
       ${doc.cautions ? `<div style="margin-top:14px;padding:12px;background:#fff3cd;border-left:4px solid #ffc107;">⚠️ <strong>注意事項：</strong>${escapeHtml(doc.cautions)}</div>` : ""}
     </div>
     <div style="margin-top:32px;">
@@ -516,6 +780,7 @@ function buildPdfHtml(doc, settings) {
                 ${t.material ? `<tr><td style="font-weight:bold;padding:5px 0;">材料：</td><td>${escapeHtml(t.material)}</td></tr>` : ""}
                 ${t.notes ? `<tr><td style="font-weight:bold;padding:5px 0;">備考：</td><td>${escapeHtml(t.notes)}</td></tr>` : ""}
               </table>
+              ${t.photoId ? `<div class="pdf-photo-wrap" style="margin-top:8px;"><img data-pdf-photo="${escapeAttr(t.photoId)}" style="max-width:260px;max-height:200px;border-radius:6px;border:1px solid #ccc;display:block;"></div>` : ""}
             </div>`).join("")
           : '<p style="color:#999;">作業内容が登録されていません</p>'
       }
@@ -528,14 +793,85 @@ function buildPdfHtml(doc, settings) {
     ${companyLine}
   </div>`;
 }
+function showPdfAreaOffscreen() {
+  const el = $("pdfPrintArea");
+  el.style.display = "block";
+  el.style.position = "fixed";
+  el.style.left = "-9999px";
+  el.style.top = "0";
+  el.style.width = "800px";
+  el.style.zIndex = "-1";
+}
+function hidePdfArea() {
+  const el = $("pdfPrintArea");
+  el.style.display = "none";
+  el.style.position = "";
+  el.style.left = "";
+  el.style.top = "";
+  el.style.width = "";
+  el.style.zIndex = "";
+}
 async function makePdf() {
   const doc = getCurrentDoc();
   if (!doc) return;
+  const warnings = [];
+  if (!doc.tasks.length) warnings.push("作業内容が1件も登録されていません");
+  if (!doc.siteName && !doc.clientName) warnings.push("現場名・会社名が未入力です");
+  if (warnings.length) {
+    showConfirmDialog(warnings.join("\n") + "\n\nこのままPDFを作成しますか？", "作成する", () => proceedMakePdf(doc));
+    return;
+  }
+  proceedMakePdf(doc);
+}
+async function proceedMakePdf(doc) {
+  vibrate(15);
   const settings = getSettings();
   $("pdfDoc").innerHTML = buildPdfHtml(doc, settings);
+  await fillPdfPhotos($("pdfDoc"));
   await waitForImages($("pdfDoc"), 2500);
-  showToast("🖨️ 印刷画面を開きます");
-  setTimeout(() => window.print(), 150);
+  showToast("📄 PDFを作成しています...");
+  await tryGenerateAndSharePdf(doc);
+}
+async function tryGenerateAndSharePdf(doc) {
+  try {
+    if (typeof html2canvas === "undefined" || typeof window.jspdf === "undefined") throw new Error("lib-not-loaded");
+    showPdfAreaOffscreen();
+    const pdfDocEl = $("pdfDoc");
+    const canvas = await html2canvas(pdfDocEl, { scale: 2, useCORS: true, backgroundColor: "#ffffff" });
+    const { jsPDF } = window.jspdf;
+    const pdf = new jsPDF({ unit: "pt", format: "a4" });
+    const pageWidth = pdf.internal.pageSize.getWidth();
+    const pageHeight = pdf.internal.pageSize.getHeight();
+    const imgWidth = pageWidth;
+    const imgHeight = (canvas.height * imgWidth) / canvas.width;
+    let heightLeft = imgHeight;
+    let position = 0;
+    const imgData = canvas.toDataURL("image/jpeg", 0.92);
+    pdf.addImage(imgData, "JPEG", 0, position, imgWidth, imgHeight);
+    heightLeft -= pageHeight;
+    while (heightLeft > 0) {
+      position = heightLeft - imgHeight;
+      pdf.addPage();
+      pdf.addImage(imgData, "JPEG", 0, position, imgWidth, imgHeight);
+      heightLeft -= pageHeight;
+    }
+    const filename = `指図書_${(doc.siteName || "無題").replace(/[\\/:*?"<>|]/g, "")}.pdf`;
+    const blob = pdf.output("blob");
+    const file = new File([blob], filename, { type: "application/pdf" });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      await navigator.share({ files: [file], title: filename, text: "工事手配指図書" });
+      showToast("✅ 共有しました");
+    } else {
+      pdf.save(filename);
+      showToast("✅ PDFを保存しました");
+    }
+  } catch (e) {
+    if (e && e.name === "AbortError") return;
+    showToast("🖨️ 印刷画面から保存してください");
+    setTimeout(() => window.print(), 150);
+  } finally {
+    hidePdfArea();
+  }
 }
 
 /* ===================== Voice input ===================== */
@@ -561,13 +897,14 @@ function initSpeech() {
     $("voiceTranscript").textContent = text || "聞き取り中...";
   };
   recognition.onerror = (e) => {
-    closeVoiceOverlay();
+    voiceTarget = null;
+    cancelVoiceUI();
     showToast("❌ 音声入力エラー：" + translateSpeechError(e.error), { type: "error" });
   };
   recognition.onend = () => {
     if (voiceTarget && lastTranscript.trim()) applyVoiceResult(voiceTarget, lastTranscript.trim());
     voiceTarget = null;
-    closeVoiceOverlay();
+    goBackOneLevel();
   };
 }
 function translateSpeechError(err) {
@@ -584,19 +921,23 @@ function startVoice(target) {
     showToast("⚠️ お使いのブラウザは音声入力に対応していません。テキストで入力してください。", { type: "error" });
     return;
   }
+  vibrate(10);
   voiceTarget = target;
   lastTranscript = "";
   $("voiceTranscript").textContent = "お話しください...";
   $("voiceFieldLabel").textContent = voiceTargetLabel(target);
   $("overlayVoice").classList.add("show");
+  pushNav();
   try { recognition.start(); } catch (e) { /* already running */ }
 }
-function closeVoiceOverlay() { $("overlayVoice").classList.remove("show"); }
-function cancelVoice() {
+function cancelVoiceUI() {
   voiceTarget = null;
   lastTranscript = "";
   try { recognition && recognition.abort(); } catch (e) {}
-  closeVoiceOverlay();
+  $("overlayVoice").classList.remove("show");
+}
+function finishVoice() {
+  try { recognition && recognition.stop(); } catch (e) {}
 }
 function applyVoiceResult(target, text) {
   if (target.type === "field") {
@@ -613,48 +954,73 @@ function applyVoiceResult(target, text) {
 
 /* ===================== Settings UI ===================== */
 function renderSettingsUI() {
-  const s = getSettings();
-  $("setCompanyName").value = s.company.name;
-  $("setCompanyPerson").value = s.company.person;
-  $("setCompanyTel").value = s.company.tel;
-  $("setDefaultCautions").value = s.defaultCautions;
-  highlightThemeChips(s.theme);
+  liveSettings = getSettings();
+  $("setCompanyName").value = liveSettings.company.name;
+  $("setCompanyPerson").value = liveSettings.company.person;
+  $("setCompanyTel").value = liveSettings.company.tel;
+  $("setDefaultCautions").value = liveSettings.defaultCautions;
+  renderLogoPreview();
+  highlightThemeChips(liveSettings.theme);
   renderPresetList("presetClientList", "clients");
   renderPresetList("presetConstructionList", "constructions");
   renderPresetList("presetTaskList", "tasks");
 }
+function closeSettingsSheet() {
+  $("overlaySettings").classList.remove("show");
+  if (liveSettings) saveSettings(liveSettings);
+}
+function renderLogoPreview() {
+  const row = $("logoPreviewRow");
+  if (liveSettings.company.logo) {
+    row.innerHTML = `<div class="photo-thumb-wrap logo-thumb-wrap"><img src="${liveSettings.company.logo}" class="photo-thumb logo-thumb" alt="ロゴ"><button class="photo-remove-btn" id="btnRemoveLogo" aria-label="ロゴを削除">✕</button></div>`;
+    $("btnRemoveLogo").onclick = () => { liveSettings.company.logo = ""; saveSettings(liveSettings); renderLogoPreview(); };
+  } else {
+    row.innerHTML = "";
+  }
+}
 function renderPresetList(containerId, key) {
-  const s = getSettings();
-  const arr = s.presets[key];
-  $(containerId).innerHTML = arr.map((v, i) => `<div class="preset-item">
-    <input type="text" value="${escapeAttr(v)}" data-idx="${i}" placeholder="未入力">
-    <button data-remove-idx="${i}" aria-label="削除">✕</button>
-  </div>`).join("") || `<p class="muted">まだ登録されていません</p>`;
+  const arr = liveSettings.presets[key];
+  if (key === "tasks") {
+    $(containerId).innerHTML = arr.map((v, i) => `<div class="preset-item preset-item-task">
+      <div class="preset-item-inputs">
+        <input type="text" value="${escapeAttr(v.content)}" data-idx="${i}" data-pfield="content" placeholder="作業内容">
+        <input type="text" value="${escapeAttr(v.material)}" data-idx="${i}" data-pfield="material" placeholder="材料（任意）">
+      </div>
+      <button data-remove-idx="${i}" aria-label="削除">✕</button>
+    </div>`).join("") || `<p class="muted">まだ登録されていません</p>`;
+  } else {
+    $(containerId).innerHTML = arr.map((v, i) => `<div class="preset-item">
+      <input type="text" value="${escapeAttr(v)}" data-idx="${i}" placeholder="未入力">
+      <button data-remove-idx="${i}" aria-label="削除">✕</button>
+    </div>`).join("") || `<p class="muted">まだ登録されていません</p>`;
+  }
 }
 function bindPresetContainer(containerId, key) {
   const el = $(containerId);
   el.addEventListener("input", (e) => {
+    if (!liveSettings) return;
     const inp = e.target.closest("input[data-idx]");
     if (!inp) return;
-    const s = getSettings();
-    s.presets[key][Number(inp.dataset.idx)] = inp.value;
-    saveSettings(s);
+    const idx = Number(inp.dataset.idx);
+    if (key === "tasks") liveSettings.presets.tasks[idx][inp.dataset.pfield] = inp.value;
+    else liveSettings.presets[key][idx] = inp.value;
+    debouncedSaveSettings();
     if (key === "clients" || key === "constructions") renderClientConstructionChips();
   });
   el.addEventListener("click", (e) => {
+    if (!liveSettings) return;
     const btn = e.target.closest("button[data-remove-idx]");
     if (!btn) return;
-    const s = getSettings();
-    s.presets[key].splice(Number(btn.dataset.removeIdx), 1);
-    saveSettings(s);
+    liveSettings.presets[key].splice(Number(btn.dataset.removeIdx), 1);
+    saveSettings(liveSettings);
     renderPresetList(containerId, key);
     if (key === "clients" || key === "constructions") renderClientConstructionChips();
   });
 }
 function addPreset(containerId, key) {
-  const s = getSettings();
-  s.presets[key].push("");
-  saveSettings(s);
+  if (!liveSettings) return;
+  liveSettings.presets[key].push(key === "tasks" ? { content: "", material: "" } : "");
+  saveSettings(liveSettings);
   renderPresetList(containerId, key);
   const inputs = document.querySelectorAll("#" + containerId + " input");
   if (inputs.length) inputs[inputs.length - 1].focus();
@@ -662,7 +1028,8 @@ function addPreset(containerId, key) {
 
 /* ===================== Export / Import ===================== */
 function exportData() {
-  const payload = { version: 2, exportedAt: new Date().toISOString(), documents: documentsCache, settings: getSettings() };
+  const settings = liveSettings || getSettings();
+  const payload = { version: 3, exportedAt: new Date().toISOString(), documents: documentsCache, settings };
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -700,6 +1067,36 @@ function handleImportFile(e) {
   reader.readAsText(file);
 }
 
+/* ===================== First-run tutorial ===================== */
+function maybeShowTutorial() {
+  if (localStorage.getItem(TUTORIAL_KEY)) return;
+  localStorage.setItem(TUTORIAL_KEY, "1");
+  const { overlay } = openEphemeral(
+    `<div class="sheet-header"><h3>👷 ようこそ！</h3></div>
+     <div class="tutorial-slides">
+       <p>📝 <b>「＋ 新しい指図書を作成」</b>から始めましょう。</p>
+       <p>🎤 <b>マイクのアイコン</b>をタップすれば、話すだけで入力できます。</p>
+       <p>⚙️ <b>右上の歯車（設定）</b>で、よく使う会社名や作業を登録しておくと、次からもっと簡単になります。</p>
+     </div>
+     <button class="btn btn-primary mt-16" data-act="ok">はじめる</button>`,
+    { center: true }
+  );
+  overlay.querySelector('[data-act="ok"]').onclick = () => overlay.remove();
+}
+
+/* ===================== Service worker update notice ===================== */
+function watchForAppUpdates(reg) {
+  reg.addEventListener("updatefound", () => {
+    const nw = reg.installing;
+    if (!nw) return;
+    nw.addEventListener("statechange", () => {
+      if (nw.state === "installed" && navigator.serviceWorker.controller) {
+        showToast("🆕 新しいバージョンがあります", { actionLabel: "更新する", onAction: () => location.reload(), duration: 10000 });
+      }
+    });
+  });
+}
+
 /* ===================== Init & event binding ===================== */
 function bindStaticEvents() {
   $("btnBack").addEventListener("click", goToHome);
@@ -709,6 +1106,8 @@ function bindStaticEvents() {
     saveDocuments();
     openDoc(doc.id);
   });
+
+  $("docSearch").addEventListener("input", () => renderDocList());
 
   $("docList").addEventListener("click", (e) => {
     const menuBtn = e.target.closest("[data-doc-menu]");
@@ -731,6 +1130,9 @@ function bindStaticEvents() {
     $(id).addEventListener("change", () => handleFieldChange(id));
   });
 
+  $("btnUseGps").addEventListener("click", useGpsForAddress);
+  $("btnZipLookup").addEventListener("click", openZipLookup);
+
   $("chipsClient").addEventListener("click", (e) => {
     const chip = e.target.closest("[data-chip-client]");
     if (!chip) return;
@@ -747,15 +1149,30 @@ function bindStaticEvents() {
   });
 
   $("fabAddTask").addEventListener("click", () => openTaskSheet(null));
-  $("btnCloseTaskSheet").addEventListener("click", closeTaskSheet);
+  $("btnCloseTaskSheet").addEventListener("click", () => requestCloseTaskSheet(false));
   $("btnSaveTask").addEventListener("click", saveTaskFromSheet);
   $("btnVoiceWholeTask").addEventListener("click", () => startVoice({ type: "wholeTask" }));
   $("chipsTaskTemplate").addEventListener("click", (e) => {
-    const chip = e.target.closest("[data-tpl]");
+    const chip = e.target.closest("[data-tpl-content]");
     if (!chip) return;
-    $("taskContent").value = chip.dataset.tpl;
+    $("taskContent").value = chip.dataset.tplContent;
+    if (chip.dataset.tplMaterial && !$("taskMaterial").value.trim()) $("taskMaterial").value = chip.dataset.tplMaterial;
   });
-  $("overlayTask").addEventListener("click", (e) => { if (e.target.id === "overlayTask") closeTaskSheet(); });
+  $("overlayTask").addEventListener("click", (e) => { if (e.target.id === "overlayTask") requestCloseTaskSheet(false); });
+  $("taskPhotoInput").addEventListener("change", async (e) => {
+    const file = e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    try {
+      const blob = await resizeImageFile(file, 1000, 0.72);
+      const id = genId();
+      await savePhotoBlob(id, blob);
+      pendingPhotoId = id;
+      renderTaskPhotoUI();
+    } catch (err) {
+      showToast("❌ 写真の読み込みに失敗しました", { type: "error" });
+    }
+  });
 
   $("tasksContainer").addEventListener("click", (e) => {
     const openBtn = e.target.closest("[data-open-task]");
@@ -772,25 +1189,42 @@ function bindStaticEvents() {
 
   document.querySelectorAll(".mic-btn[data-field]").forEach((b) => b.addEventListener("click", () => startVoice({ type: "field", id: b.dataset.field })));
   document.querySelectorAll(".mic-btn[data-tfield]").forEach((b) => b.addEventListener("click", () => startVoice({ type: "taskfield", id: b.dataset.tfield })));
-  $("btnVoiceCancel").addEventListener("click", cancelVoice);
-  $("overlayVoice").addEventListener("click", (e) => { if (e.target.id === "overlayVoice") cancelVoice(); });
+  $("btnVoiceCancel").addEventListener("click", goBackOneLevel);
+  $("btnVoiceDone").addEventListener("click", finishVoice);
+  $("overlayVoice").addEventListener("click", (e) => { if (e.target.id === "overlayVoice") goBackOneLevel(); });
 
-  $("btnSettings").addEventListener("click", () => { renderSettingsUI(); $("overlaySettings").classList.add("show"); });
-  $("btnCloseSettings").addEventListener("click", () => $("overlaySettings").classList.remove("show"));
-  $("overlaySettings").addEventListener("click", (e) => { if (e.target.id === "overlaySettings") $("overlaySettings").classList.remove("show"); });
+  $("btnSettings").addEventListener("click", () => { renderSettingsUI(); $("overlaySettings").classList.add("show"); pushNav(); });
+  $("btnCloseSettings").addEventListener("click", goBackOneLevel);
+  $("overlaySettings").addEventListener("click", (e) => { if (e.target.id === "overlaySettings") goBackOneLevel(); });
 
   document.querySelectorAll("[data-theme-choice]").forEach((chip) => chip.addEventListener("click", () => {
-    const s = getSettings();
-    s.theme = chip.dataset.themeChoice;
-    saveSettings(s);
-    applyTheme(s.theme);
-    highlightThemeChips(s.theme);
+    if (!liveSettings) liveSettings = getSettings();
+    liveSettings.theme = chip.dataset.themeChoice;
+    saveSettings(liveSettings);
+    applyTheme(liveSettings.theme);
+    highlightThemeChips(liveSettings.theme);
   }));
 
-  $("setCompanyName").addEventListener("input", (e) => { const s = getSettings(); s.company.name = e.target.value; saveSettings(s); });
-  $("setCompanyPerson").addEventListener("input", (e) => { const s = getSettings(); s.company.person = e.target.value; saveSettings(s); });
-  $("setCompanyTel").addEventListener("input", (e) => { const s = getSettings(); s.company.tel = e.target.value; saveSettings(s); });
-  $("setDefaultCautions").addEventListener("input", (e) => { const s = getSettings(); s.defaultCautions = e.target.value; saveSettings(s); });
+  $("setCompanyName").addEventListener("input", (e) => { if (!liveSettings) return; liveSettings.company.name = e.target.value; debouncedSaveSettings(); });
+  $("setCompanyPerson").addEventListener("input", (e) => { if (!liveSettings) return; liveSettings.company.person = e.target.value; debouncedSaveSettings(); });
+  $("setCompanyTel").addEventListener("input", (e) => { if (!liveSettings) return; liveSettings.company.tel = e.target.value; debouncedSaveSettings(); });
+  $("setDefaultCautions").addEventListener("input", (e) => { if (!liveSettings) return; liveSettings.defaultCautions = e.target.value; debouncedSaveSettings(); });
+
+  $("btnSetCompanyLogo").addEventListener("click", () => $("setCompanyLogoInput").click());
+  $("setCompanyLogoInput").addEventListener("change", async (e) => {
+    const file = e.target.files[0];
+    e.target.value = "";
+    if (!file || !liveSettings) return;
+    try {
+      const blob = await resizeImageFile(file, 240, 0.82);
+      liveSettings.company.logo = await blobToDataUrl(blob);
+      saveSettings(liveSettings);
+      renderLogoPreview();
+      showToast("✅ ロゴを設定しました");
+    } catch (err) {
+      showToast("❌ 画像の読み込みに失敗しました", { type: "error" });
+    }
+  });
 
   bindPresetContainer("presetClientList", "clients");
   bindPresetContainer("presetConstructionList", "constructions");
@@ -806,8 +1240,13 @@ function bindStaticEvents() {
     showConfirmDialog("保存されているすべての指図書と設定を削除します。この操作は元に戻せません。", "すべて削除する", () => {
       localStorage.removeItem(DOCS_KEY);
       localStorage.removeItem(SETTINGS_KEY);
+      localStorage.removeItem(TUTORIAL_KEY);
       location.reload();
     }, true);
+  });
+
+  window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+    if (getSettings().theme === "auto") applyTheme("auto");
   });
 }
 
@@ -818,8 +1257,12 @@ function init() {
   bindStaticEvents();
   initSpeech();
   showScreen("home");
+  cleanupOrphanPhotos();
+  maybeShowTutorial();
   if ("serviceWorker" in navigator) {
-    window.addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(() => {}));
+    window.addEventListener("load", () => {
+      navigator.serviceWorker.register("sw.js").then((reg) => watchForAppUpdates(reg)).catch(() => {});
+    });
   }
 }
 
